@@ -5,44 +5,35 @@ import streamlit as st
 from PIL import Image
 from openai import OpenAI
 
-# Show title and description.
-st.title("💬 Chatbot + 🩰 Pose Evaluator")
-st.write(
-    "This is Suparna's chatbot that uses OpenAI to generate responses. "
-    "Upload a dance pose photo and ask for an evaluation (score + coaching cues)."
-)
+# -----------------------------
+# Page + API key
+# -----------------------------
+st.set_page_config(page_title="Chatbot + PoseMirror", page_icon="🩰", layout="centered")
+st.title("💬 Chatbot + 🩰 PoseMirror")
 
-# Ask user for their OpenAI API key
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-    st.stop()
+openai_api_key = st.secrets['OPENAI_API_KEY']
 
-# Create an OpenAI client.
 client = OpenAI(api_key=openai_api_key)
 
-# Session state to store chat messages (persist across reruns).
-# We'll optionally store an image per user message as base64.
+# -----------------------------
+# Session state
+# -----------------------------
 if "messages" not in st.session_state:
+    # Each message can optionally contain image_b64
     st.session_state.messages = []
+if "pose_notes" not in st.session_state:
+    st.session_state.pose_notes = ""
 
-# ---- Helpers ----
+# -----------------------------
+# Helpers
+# -----------------------------
 def uploaded_file_to_b64_png(uploaded_file) -> str:
-    """Convert uploaded image to a base64-encoded PNG data payload."""
     img = Image.open(uploaded_file).convert("RGB")
     buf = BytesIO()
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-def build_vision_messages(history, latest_prompt: str, latest_image_b64: str | None):
-    """
-    Convert session history to OpenAI 'content' format.
-    For prior messages: keep them as text (simple).
-    For the latest user message: include image + rubric so the model evaluates the pose.
-    """
-    # Keep previous turns as plain text to avoid re-sending old images every time.
-    msgs = [{"role": m["role"], "content": m["content"]} for m in history[:-1]]
-
+def build_pose_eval_messages(user_notes: str, image_b64: str):
     rubric = """
 You are a dance technique coach. Evaluate the dancer's pose from the image and the user's request.
 
@@ -56,24 +47,90 @@ Return:
 Be encouraging but precise. If the image is missing/unclear, ask for a clearer full-body photo and explain what you can't see.
 Do NOT identify the person.
 """
+    notes = user_notes.strip() if user_notes else "No extra notes."
+    return [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"{rubric}\n\nUser notes/context: {notes}"},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+            ],
+        }
+    ]
 
-    # Latest user turn: use multimodal content if image exists
-    if latest_image_b64:
-        latest_content = [
-            {"type": "text", "text": rubric + "\n\nUser request: " + (latest_prompt or "Please evaluate this pose.")},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{latest_image_b64}"}},
-        ]
-        msgs.append({"role": "user", "content": latest_content})
+def run_pose_eval(image_b64: str, user_notes: str) -> str:
+    # Choose a vision-capable model (swap to gpt-5-mini ONLY if your account supports vision on it).
+    model = "gpt-4.1-mini"
+    resp = client.chat.completions.create(
+        model=model,
+        messages=build_pose_eval_messages(user_notes, image_b64),
+    )
+    return resp.choices[0].message.content
+
+# -----------------------------
+# 1) PoseMirror input area (posts into chat)
+# -----------------------------
+st.subheader("🩰 PoseMirror")
+
+c1, c2 = st.columns([1, 1])
+
+with c1:
+    pose_file = st.file_uploader(
+        "Upload a dance pose photo",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=False,
+        key="pose_upload",
+        label_visibility="collapsed",
+    )
+
+with c2:
+    st.session_state.pose_notes = st.text_area(
+        "What should I focus on? (optional)",
+        value=st.session_state.pose_notes,
+        placeholder="e.g., arabesque line, turnout, torso lift, arm placement, balance",
+        height=110,
+    )
+
+eval_clicked = st.button("Evaluate Pose → post to chat", type="primary", use_container_width=True)
+
+# If user clicks, add to chat + generate assistant reply
+if eval_clicked:
+    if not pose_file:
+        st.warning("Please upload a photo first.")
     else:
-        # No image: just ask as normal chat (or pose-eval request without image)
-        msgs.append({"role": "user", "content": (latest_prompt or "Please evaluate my pose (no image attached).")})
+        image_b64 = uploaded_file_to_b64_png(pose_file)
 
-    return msgs
+        # Add a user chat message that includes the image
+        user_text = "Evaluate this pose."
+        if st.session_state.pose_notes.strip():
+            user_text += f"\n\n**Focus:** {st.session_state.pose_notes.strip()}"
 
-# ---- Display existing chat messages ----
+        st.session_state.messages.append(
+            {"role": "user", "content": user_text, "image_b64": image_b64}
+        )
+
+        # Generate assistant response
+        with st.spinner("Evaluating pose…"):
+            try:
+                result = run_pose_eval(image_b64, st.session_state.pose_notes)
+            except Exception as e:
+                result = f"Sorry—something went wrong while evaluating the pose: `{e}`"
+
+        st.session_state.messages.append({"role": "assistant", "content": result})
+
+        # Clear the uploader + notes if you want a “new eval” feel
+        st.session_state.pose_notes = ""
+        st.rerun()
+
+st.divider()
+
+# -----------------------------
+# 2) Chat thread (shows both normal chat + pose eval posts)
+# -----------------------------
+st.subheader("💬 Chat")
+
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        # If the message has an image, render it
         if message.get("image_b64"):
             st.image(
                 base64.b64decode(message["image_b64"]),
@@ -82,46 +139,18 @@ for message in st.session_state.messages:
             )
         st.markdown(message["content"])
 
-# ---- Chat-like upload + input ----
-uploaded = st.file_uploader(
-    "Upload a dance pose photo (optional)",
-    type=["png", "jpg", "jpeg"],
-    accept_multiple_files=False,
-    label_visibility="collapsed",
-    key="pose_upload",
-)
-
-if prompt := st.chat_input("Ask anything, or upload a dance pose and ask for a rating…"):
-    image_b64 = uploaded_file_to_b64_png(uploaded) if uploaded else None
-
-    # Store and display the user's prompt (+ image if any)
-    st.session_state.messages.append({"role": "user", "content": prompt, "image_b64": image_b64})
+# Normal text chat input
+if prompt := st.chat_input("Ask anything… (pose evals appear here too)"):
+    st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
-        if image_b64:
-            st.image(base64.b64decode(image_b64), caption="Uploaded pose", use_container_width=True)
         st.markdown(prompt)
 
-    # Decide which model to use:
-    # - If an image is attached, use a vision-capable model.
-    # - Otherwise, you can keep gpt-3.5-turbo or upgrade.
-    if image_b64:
-        model = "gpt-4.1-mini"   # vision-capable (good cost/latency)
-    else:
-        model = "gpt-3.5-turbo"  # your original choice
-
-    # Build messages payload
-    messages_payload = build_vision_messages(
-        st.session_state.messages,
-        latest_prompt=prompt,
-        latest_image_b64=image_b64,
-    )
-
-    # Stream the response
     with st.chat_message("assistant"):
         try:
+            # Keep text chat as-is; you can upgrade to gpt-5-mini (text) if you want
             stream = client.chat.completions.create(
-                model=model,
-                messages=messages_payload,
+                model="gpt-3.5-turbo",
+                messages=[{"role": m["role"], "content": m["content"]} for m in st.session_state.messages],
                 stream=True,
             )
             response = st.write_stream(stream)
@@ -129,5 +158,4 @@ if prompt := st.chat_input("Ask anything, or upload a dance pose and ask for a r
             response = f"Sorry—something went wrong: `{e}`"
             st.error(response)
 
-    # Store assistant response
     st.session_state.messages.append({"role": "assistant", "content": response})
